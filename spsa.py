@@ -1,72 +1,100 @@
 # spsa.py
-from dataclasses import dataclass
-from typing import Tuple, Optional
 import torch
-import torch.nn as nn
-
-@dataclass
-class SPSAConfig:
-    steps: int = 300
-    a: float = 5e-2
-    c: float = 1e-2
-    A: float = 10.0
-    alpha: float = 0.602
-    gamma: float = 0.101
-    batch_size_for_obj: int = 512
-    grad_clip: Optional[float] = 0.1
-    clip_norm: float = 0.1
-    auto_gain: bool = True
-    target_update_norm: float = 1e-2
-    gain_clip: Tuple[float,float] = (0.2, 5.0)
-
-@torch.no_grad()
-def ce_loss_no_grad(model, X, y):
-    logits = model(X)
-    return nn.functional.cross_entropy(logits, y, reduction="mean")
+import torch.nn.functional as F
+from typing import Optional, Tuple
 
 @torch.no_grad()
 def spsa_update_Wrec(
-    model, X, y, ce_loss, a_k, c_k,
-    grad_clip: Optional[float] = 0.1,
-    clip_norm: float = 0.1,
-    auto_gain: bool = True,
-    target_update_norm: float = 1e-2,
-    gain_clip: Tuple[float,float] = (0.2, 5.0),
+    model,
+    X, y,
+    ce_loss,                
+    a_k: float,
+    c_k: float,
+    grad_clip: Optional[float] = None,     
+    clip_norm: Optional[float] = None,    
+    auto_gain: bool = False,              
+    target_update_norm: Optional[float] = None,
+    gain_clip: Optional[Tuple[float, float]] = None, 
+    mask: Optional[torch.Tensor] = None,    
 ):
+
     W = model.W_rec
-    W0 = W.data.clone()
-    delta = (torch.randint_like(W, 2) * 2 - 1).to(torch.float32)
+    device = W.device
+    dtype  = W.dtype
 
-    W.data = W0 + c_k * delta; Jp = ce_loss(model, X, y)
-    macs_jp = int(getattr(model, "_last_forward_macs", 0))
-    W.data = W0 - c_k * delta; Jm = ce_loss(model, X, y)
-    macs_jm = int(getattr(model, "_last_forward_macs", 0))
-    W.data = W0
 
-    g_coeff = (Jp - Jm) / (2.0 * c_k)
-    g_hat   = g_coeff * (1.0 / (delta + 1e-12))
+    Delta = torch.empty_like(W, device=device, dtype=dtype).bernoulli_(0.5).mul_(2.).sub_(1.)
+    if mask is not None:
+
+        Delta = torch.where(mask, Delta, torch.zeros_like(Delta))
+
+    c = float(c_k)
+
+
+    W_orig = W.clone()
+
+
+    W_plus  = W_orig + c * Delta
+    W_minus = W_orig - c * Delta
+
+
+    W.copy_(W_plus)
+    loss_plus = float(ce_loss(model, X, y))
+
+
+    W.copy_(W_minus)
+    loss_minus = float(ce_loss(model, X, y))
+
+
+    W.copy_(W_orig)
+
+    scale = (loss_plus - loss_minus) / (2.0 * c + 1e-12)
+    ghat = Delta * scale
+
+
+    if mask is not None:
+        ghat = torch.where(mask, ghat, torch.zeros_like(ghat))
+
+
     if grad_clip is not None:
-        g_hat = torch.clamp(g_hat, -grad_clip, grad_clip)
+        ghat.clamp_(min=-grad_clip, max=grad_clip)
 
-    gn = torch.linalg.norm(g_hat)
-    if gn > clip_norm:
-        g_hat.mul_(clip_norm / (gn + 1e-12))
+    if clip_norm is not None:
+        n = ghat.norm().item()
+        if n > clip_norm and n > 0:
+            ghat.mul_(clip_norm / (n + 1e-12))
 
-    if auto_gain:
-        pred_upd_norm = a_k * (torch.linalg.norm(g_hat) + 1e-12)
-        scale = float(target_update_norm / pred_upd_norm)
-        scale = max(gain_clip[0], min(gain_clip[1], scale))
-        a_k = a_k * scale
+    update = -a_k * ghat 
 
-    W.add_(-a_k * g_hat)
 
-    dW = -a_k * g_hat
-    upd_norm = float(torch.linalg.norm(dW))
-    rel_upd  = upd_norm / (float(torch.linalg.norm(W)) + 1e-12)
-    jm_gap   = float(abs(Jp.item() - Jm.item()))
+    if auto_gain and (target_update_norm is not None):
+        un = update.norm().item()
+        if un > 0:
+            gain = target_update_norm / (un + 1e-12)
+            if gain_clip is not None:
+                gain = max(gain_clip[0], min(gain, gain_clip[1]))
+            update.mul_(gain)
+
+
+    if mask is not None:
+        update = torch.where(mask, update, torch.zeros_like(update))
+
+
+    W.add_(update)
+
+
     return {
-        "Jp": float(Jp.item()), "Jm": float(Jm.item()),
-        "g_norm": float(torch.linalg.norm(g_hat).item()),
-        "a_k": float(a_k), "macs_spsa": int(macs_jp + macs_jm),
-        "upd_norm": upd_norm, "rel_upd": rel_upd, "jm_gap": jm_gap
+        "loss_plus": loss_plus,
+        "loss_minus": loss_minus,
+        "est_grad_norm": float(ghat.norm().item()),
+        "update_norm": float(update.norm().item()),
+        "c_k": float(c_k),
+        "a_k": float(a_k),
+        "masked_frac": float(mask.float().mean().item()) if mask is not None else 1.0,
     }
+@torch.no_grad()
+def ce_loss_no_grad(model, X, y):
+    # 如果你的 forward 有可选返回 (logits, spk_seq)，确保只拿 logits：
+    logits = model(X)                 # 等价于 model.forward(X)
+    loss = F.cross_entropy(logits, y, reduction="mean")
+    return float(loss.item())
