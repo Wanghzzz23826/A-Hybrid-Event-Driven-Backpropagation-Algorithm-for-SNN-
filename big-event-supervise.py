@@ -14,7 +14,7 @@ from typing import Tuple, Optional, List
 from pathlib import Path
 import torch.nn.functional as F
 from collections import deque
-from spsa import SPSAConfig, spsa_update_Wrec, ce_loss_no_grad
+from spsa import spsa_update_Wrec,ce_loss_no_grad
 USE_SPSA = False 
 try:
     from thop import profile
@@ -442,8 +442,27 @@ class SynchronyMoniter(nn.Module):
         self.local_sigma = float(local_sigma) if local_sigma is not None else max(1.0, self.sigma / 2.0)
         self.local_window = int(local_window) if local_window is not None else max(1, self.window // 2)
 
-        # 缓存 kernel 原型
-        self.register_buffer("_kernel", torch.empty(0))
+        self._streak = 0
+ 
+        self.hist_len=200
+        self.sync_hist=deque(maxlen=self.hist_len)
+        self.ema_beta=0.9
+        self.sync_ema=0.0
+        self.cooldown=20            # 冷却时间
+        self._cool=0
+        self.need_streak=2          #连续多少次才触发
+
+        # Nsync的统计缓存
+        self.win_len_pairs = 50
+        self.strong_tau = 0.25              #判断强同步的阈值
+        self.strong_hist = deque(maxlen=self.win_len_pairs)
+        self.nsync_thresh = 1500            # 窗内强同步对数阈（可变）
+
+        #局部更新
+        self.sub_pct = 0.90                 # 选前10%参与度的 post/pre
+        self.min_sub = 3                    # 至少这么多个神经元才触发局部SPSA
+
+
 
     def _build_kernel(self, T: int, device, *, kernel: str, sigma: float, window: int):
         if kernel == "gaussian":
@@ -519,7 +538,7 @@ class SynchronyMoniter(nn.Module):
         # 屏蔽“双方都没发”
         valid = (pre_spk.sum(1) > 0).unsqueeze(1) & (post_spk.sum(1) > 0).unsqueeze(2)
         S = torch.where(valid, S, torch.zeros_like(S))
-        return S  # [B,C_out,C_in]
+        return S  # [B,C_out,C_in] 
 
     @torch.no_grad()
     def forward(self, pre_spk, post_spk):
@@ -586,6 +605,79 @@ class SynchronyMoniter(nn.Module):
             "pre_particip": pre_particip  
         }
         return S, agg
+
+    @torch.no_grad()
+    def update_and_check(self,pre_spk,post_spk):
+        """
+        调用 forward 得到 S, agg 后，再调用本函数完成：
+        对真正同步事件的检查
+        1、层级同步显著高于近期水平(滤波)：layer_sync=mean(S),sync_ema(t)=beta*sync_ema(t-1)+(1-beta)*layer_sync
+        2、层级同步达到峰值门：layer_sync > peak_tau (peak_tau 自适应)且连续发生3次才将峰值视为持续的强同步
+        3、定义强同步对：S_ij > strong_tau (0.2)，统计窗口内强同步对数并求和
+        4、给系统冷却时间cooldown，避免过于频繁触发
+        5、局部更新：pre、post各自取top-k挑中的子块权重
+
+        """
+        S, agg = self(pre_spk, post_spk)     # 复用你已有的分数
+        layer_sync = float(agg["layer_sync"].mean().item())
+        self.sync_ema = self.ema_beta * self.sync_ema + (1. - self.ema_beta) * layer_sync
+        self.sync_hist.append(layer_sync)
+
+        # --- 强同步对统计（看第一个样本的 S 矩阵；也可用 batch 均值）---
+        S0 = S[0]                            # [H,H]
+        strong_cnt = int((S0 > self.strong_tau).sum().item())
+        self.strong_hist.append(strong_cnt)
+        win_sum = int(sum(self.strong_hist))
+
+        # --- 自适应阈：用历史分位数做“峰值门” ---
+        # 若历史还不够长，就退化用固定值 0.11
+        import numpy as np
+        if len(self.sync_hist) >= max(20, int(0.25*self.hist_len)):
+            peak_tau = float(np.quantile(np.array(self.sync_hist), 0.90))  # P90
+        else:
+            peak_tau = 0.11
+
+        is_peak = (layer_sync > peak_tau)
+        self._streak = self._streak + 1 if is_peak else 0
+        win_over = (win_sum >= self.nsync_thresh)
+
+        # 冷却计数器
+        if self._cool > 0:
+            self._cool -= 1
+
+        # --- 触发条件：峰值门(持续) AND 窗口门 AND 非冷却 ---
+        trigger = (self._streak >= self.need_streak) and win_over and (self._cool == 0)
+
+        # --- 为“局部-SPSA”挑子群：按参与度选前10% ---
+        # post_particip: [B,C_out] 取第一个样本
+        post_part = agg["post_particip"][0]         # [H]
+        pre_part  = agg["pre_particip"][0]          # [H]
+        H = post_part.numel()
+        k_post = max(self.min_sub, int(np.ceil((1.0 - self.sub_pct) * H)))
+        k_pre  = max(self.min_sub, int(np.ceil((1.0 - self.sub_pct) * H)))
+        _, idx_post = torch.topk(post_part, k=k_post)
+        _, idx_pre  = torch.topk(pre_part,  k=k_pre)
+
+        
+        sub = {
+            "post_idx": idx_post.detach().cpu().tolist(),
+            "pre_idx":  idx_pre.detach().cpu().tolist(),
+        }
+
+        if trigger:
+            self._cool = self.cooldown      
+            self._streak = 0                
+        strong_ratio = strong_cnt / float(S0.numel())
+        info = {
+            "S": S, "agg": agg,
+            "layer_sync": layer_sync, "sync_ema": self.sync_ema,
+            "peak_tau": peak_tau, "is_peak": bool(is_peak),
+            "streak": int(self._streak), "win_sum": win_sum,
+            "trigger": bool(trigger), "strong_cnt": strong_cnt,
+            "sub_idx": sub,"strong_ratio": float(strong_ratio),
+        }
+        return info
+       
 
 # ---------------------------------------------------------------------
 # 评估
@@ -698,37 +790,24 @@ def estimate_forward_flops(model: nn.Module, x_batch: torch.Tensor) -> Tuple[flo
 @dataclass
 class MainCfg:
     npz_path: str = "nmini_0v1_T50_singlech.npz"
-    hidden_dim: int = 128
-    batch_size: int = 32
+    hidden_dim: int = 64
+    batch_size: int = 16
     tau_m: float = 4.0
-    tau_n: float = 4.0
-    input_scale: float = 1.0
-    rec_density: float = 0.05
-    spectral_radius: float = 0.9
-    spsa_grad_clip: Optional[float] = 0.1   # 逐元素裁剪
-    spsa_clip_norm: float = 0.1             # 梯度 L2 裁剪
-    wrec_param_clip: float = 5.0            # 参数 L2 裁剪
-    readout_agg: str = "mem_peak"#last_spike/mean_mem/spike_trace/first_latency/mem_peak
-    out_tau     = 5.0
-    #readout
-    hist_bins: int = 5
-    trace_tau: Optional[float] = None
-    kernel_tau: float = 5.0
-    # SPSA
-    steps: int = 300
-    a: float = 5e-2
-    c: float = 1e-2
+    out_tau: float = 5.0
+    steps: int = 300             
+    a: float = 5e-2              # SPSA a0
+    c: float = 1e-2              # SPSA c0
     A: float = 10.0
     alpha: float = 0.602
     gamma: float = 0.101
-    batch_for_obj: int = 512
-    grad_clip: Optional[float] = None
-    # event driven
-    event_driven_rec: bool = True
-    min_active_to_dense: int = 8
-    # 脉冲稀疏正则系数
-    spike_reg_lambda: float = 5e-2
-    target_spike_rate: float = 0.05
+    spsa_grad_clip: Optional[float] = 0.1
+    spsa_clip_norm: float = 0.1
+    wrec_param_clip: float = 5.0
+    lr: float = 1e-3
+    wd: float = 1e-4
+    epochs: int = 10
+    topk_pairs: int = 20
+    enable_plots: bool = True   
 
 def main():
     set_seed(310)
@@ -751,13 +830,13 @@ def main():
 
 
     sync_mon = SynchronyMoniter(
-        mode="all",
+        mode="hybrid",
         sigma=3.0,
         window=5,
         norm="min",
         alpha=0.85,
         local_sigma=1.5,
-        local_window=3,
+        local_window=5,
         local_kernel="gaussian"
     ).to(device)
 
@@ -784,8 +863,6 @@ def main():
     raster_cache = [] 
     raster_max_neurons = 128
 
-
-
     for ep in range(1, epochs + 1):
         model.train()
         for X, y in dl_tr:
@@ -798,112 +875,73 @@ def main():
                 _cached_forward_flops = fwd_flops
                 _cached_param_cnt     = n_params
 
-            # --------  e-prop 段（取代 BP）--------
+            # --------  e-prop 段 --------
             optimizer.zero_grad()
             model.eprop_train_step(X, y)   # e-prop 写入 .grad（w_in/w_rec/w_out）
             optimizer.step()
 
-
-
             with torch.no_grad():
                 logits, spk_seq = model(X, return_spk=True)
                 train_loss = criterion(logits, y).item()
-          
-                if spk_seq.size(1) >= 2:
-                    pre_spk  = spk_seq[:, :-1, :]        # [B,T-1,H]
-                    post_spk = spk_seq[:,  1:, :]       
+            # --------  同步检测+局部触发 --------
+            if spk_seq.size(1) >= 2:
+                pre_spk  = spk_seq[:, :-1, :]        # [B,T-1,H]
+                post_spk = spk_seq[:,  1:, :]        # [B,T-1,H]
 
-                    if sync_mon.mode == "hybrid":
-                        comp = hybrid_decompose(sync_mon, pre_spk, post_spk)
-                        history.append({
-                            "step": global_step, "epoch": ep, "phase": "hybrid_comp",
-                            **comp
-                        })
-
-                    S, agg = sync_mon(pre_spk, post_spk) 
-                    layer_sync_batch = agg["layer_sync"].mean().item()
-
-                    sync_ema = ema_beta * sync_ema + (1.0 - ema_beta) * layer_sync_batch
-                    history.append({
-                        "step": global_step, "epoch": ep, "phase": "sync",
-                        "sync_layer": float(layer_sync_batch),
-                        "sync_ema": float(sync_ema),
-                    })
-
-                    spk_t_h = spk_seq[0].float()            
-                    spikes_per_t = spk_t_h.sum(dim=1)        
-                    win_t = 5
-                    kernel = torch.ones(win_t, device=spk_t_h.device).view(1,1,-1)
-                    pad = win_t // 2
-                    spikes_win = F.conv1d(spikes_per_t.view(1,1,-1), kernel, padding=pad).view(-1)
-                    history.append({
-                        "step": global_step, "epoch": ep, "phase": "spk_window",
-                        "spk_win_mean": float(spikes_win.mean().item()),
-                        "spk_win_max":  float(spikes_win.max().item()),
-                    })
+                mon = sync_mon.update_and_check(pre_spk, post_spk)   
 
 
-                    # 强同步对
-                    SYNC_TAU = 0.20    # 建议先用 0.18~0.20，0.25 往往太高
-                    S0 = S[0].detach().cpu()
-                    strong = (S0 > SYNC_TAU)
-                    strong_cnt  = int(strong.sum().item())
-                    strong_ratio = float(strong.float().mean().item())
-
-                    # 连续超阈值（用层均值作为“峰值”）
-                    PEAK_TAU = 0.11
-                    is_peak = (layer_sync_batch > PEAK_TAU)
-                    _sync_streak = _sync_streak + 1 if is_peak else 0
-
-                    # 滑动窗口里累计强同步对数
-                    _sync_q.append(strong_cnt)
-                    window_sum = int(sum(_sync_q))
-                    Nsync = 1500
-                    win_over = (window_sum >= Nsync)
-
-                    # 记日志（phase='sync_diag'）
-                    history.append({
-                        "step": global_step, "epoch": ep, "phase": "sync_diag",
-                        "layer_sync": float(layer_sync_batch),
-                        "strong_cnt": strong_cnt, "strong_ratio": strong_ratio,
-                        "streak": int(_sync_streak), "win_sum": int(window_sum),
-                        "win_over": bool(win_over),
-                    })
+            if mon["trigger"]:
+                print(f"[TRIGGER] step={global_step} ep={ep} "
+                    f"layer_sync={mon['layer_sync']:.4f} "
+                    f"peak_tau={mon['peak_tau']:.4f} "
+                    f"win_sum={mon['win_sum']} "
+                    f"sub|post={len(mon['sub_idx']['post_idx'])} "
+                    f"pre={len(mon['sub_idx']['pre_idx'])}")
 
 
-                    # Top-K 对（看第 1 个样本）
-                    S0 = S[0].detach().cpu()                  # [H,H]
-                    H  = S0.size(0)
-                    K  = min(TOPK_PAIRS, H*H)
-                    vals, idx = torch.topk(S0.reshape(-1), k=K)
-                    top_pairs = [(int(i//H), int(i%H), float(v)) for i, v in zip(idx, vals)]
-                    history.append({
-                        "step": global_step, "epoch": ep, "phase": "sync_topk",
-                        "top_pairs": top_pairs
-                    })
+                S0 = mon["S"][0]  # [H,H]，第一个样本
+                K = min(TOPK_PAIRS, S0.numel())
+                vals, flat_idx = torch.topk(S0.flatten(), k=K)
+                rows = (flat_idx // S0.size(1)).tolist()
+                cols = (flat_idx %  S0.size(1)).tolist()
+                pairs = [{"post": int(r), "pre": int(c), "score": float(v)}
+                        for r, c, v in zip(rows, cols, vals.detach().cpu().tolist())]
 
-                    # 可视化：每隔 PLOT_EVERY 步画一张热图
-                    if (global_step % PLOT_EVERY) == 0:
-                        plt.figure(figsize=(5,4))
-                        plt.imshow(S0.numpy(), aspect="auto", interpolation="nearest")
-                        plt.colorbar(label="Synchrony score")
-                        plt.xlabel("pre (i)"); plt.ylabel("post (j)")
-                        plt.title(f"S[0] heatmap @ step {global_step}")
-                        savefig_safe(FIG_DIR / f"sync_heatmap_step{global_step}.png")
+                # 记到 history
+                history.append({
+                    "step": global_step, "epoch": ep, "phase": "sync_diag", "top_pairs": pairs,
+                    "layer_sync": float(mon["layer_sync"]),
+                    "sync_ema":   float(mon["sync_ema"]),
+                    "peak_tau":   float(mon["peak_tau"]),
+                    "is_peak":    bool(mon["is_peak"]),
+                    "streak":     int(mon["streak"]),
+                    "win_sum":    int(mon["win_sum"]),
+                    "strong_cnt": int(mon["strong_cnt"]),
+                    "trigger":    bool(mon["trigger"]),
+                    "strong_ratio": float(mon["strong_ratio"]),
+                })
+                if USE_SPSA and mon["trigger"]:
+                    post_idx = mon["sub_idx"]["post_idx"]
+                    pre_idx  = mon["sub_idx"]["pre_idx"]
 
-                    # （可选）触发 SPSA：只在 USE_SPSA=True 且达到阈值时
-                    # if USE_SPSA and (sync_ema > SYNC_TRIGGER):
-                    #     a_k = a0 / ((global_step + A) ** alpha)
-                    #     c_k = c0 / (global_step ** gamma)
-                    #     mon = spsa_update_Wrec(
-                    #         model, X, y, ce_loss=ce_loss_no_grad,
-                    #         a_k=a_k, c_k=c_k,
-                    #         grad_clip=MainCfg.spsa_grad_clip,
-                    #         clip_norm=MainCfg.spsa_clip_norm,
-                    #         auto_gain=True, target_update_norm=1e-2, gain_clip=(0.2, 5.0)
-                    #     )
-                    #     history.append({**mon, "step": global_step, "epoch": ep, "phase": "spsa_stat"})
-                
+                    mask = torch.zeros_like(model.W_rec, dtype=torch.bool)
+                    mask[torch.tensor(post_idx, device=mask.device)[:, None],
+                        torch.tensor(pre_idx,  device=mask.device)[None, :]] = True
+
+                    a_k = a0 / ((global_step + A) ** alpha)
+                    c_k = c0 / (global_step ** gamma)
+
+                    mon_spsa = spsa_update_Wrec(
+                        model, X, y, ce_loss=ce_loss_no_grad,
+                        a_k=a_k, c_k=c_k,
+                        grad_clip=MainCfg.spsa_grad_clip,
+                        clip_norm=MainCfg.spsa_clip_norm,
+                        auto_gain=True, target_update_norm=1e-2, gain_clip=(0.2, 5.0),
+                        mask=mask,                     
+                    )
+                    history.append({**mon_spsa, "step": global_step, "epoch": ep, "phase": "spsa_stat"})
+     
             history.append({
                 "step": global_step , "epoch": ep, "phase": "eprop",
                 "train_loss": float(train_loss),
@@ -935,19 +973,28 @@ def main():
 
         # === 保存 CSV + 画图 ===
         pd.DataFrame(history).to_csv(RUN_DIR / "rsnn_spsa_history.csv", index=False)
-    
         hist_df = pd.DataFrame(history)
-
-        df_sync = hist_df[hist_df["phase"] == "sync"]
+        df_sync = hist_df[hist_df["phase"] == "sync_diag"]
         if len(df_sync):
+
+            # 1) 导出触发清单 triggers.csv
+            df_trig = df_sync.loc[df_sync["trigger"] == True,
+                                ["step","epoch","layer_sync","peak_tau","win_sum","strong_cnt","strong_ratio"]]
+            if len(df_trig):
+                df_trig.to_csv(RUN_DIR / "triggers.csv", index=False)
+
+            # 2) 同步曲线 + 触发竖线（便于目视查看）
             plt.figure()
-            plt.plot(df_sync["step"], df_sync["sync_layer"], label="batch layer_sync", alpha=0.35)
+            plt.plot(df_sync["step"], df_sync["layer_sync"], label="batch layer_sync", alpha=0.35)
             plt.plot(df_sync["step"], df_sync["sync_ema"],   label="EMA", linewidth=2)
+            # 在发生触发的 step 位置画竖线
+            for s in df_sync.loc[df_sync["trigger"] == True, "step"]:
+                plt.axvline(s, linestyle="--", alpha=0.25)
             plt.xlabel("Step"); plt.ylabel("Synchrony score")
-            plt.title("Layer Synchrony (batch & EMA)")
+            plt.title("Layer Synchrony (batch & EMA, with TRIGGER markers)")
             plt.legend()
-            savefig_safe(FIG_DIR / "sync_timeseries.png")
-    
+            savefig_safe(FIG_DIR / "sync_timeseries_with_triggers.png")
+
         df_ep = hist_df[hist_df["phase"] == "eprop"]
         if len(df_ep):
             plt.figure()
