@@ -1,5 +1,5 @@
 # rsnn_with_spsa.py
-#only W_in use SGD W_out and W_rec use SPSA do empirical gradient
+#only W_out use SGD W_in and W_rec use SPSA do empirical gradient
 import os
 import numpy as np
 import pandas as pd
@@ -315,7 +315,7 @@ class SynchronyMoniter(nn.Module):
 
         # Nsync的统计缓存
         self.win_len_pairs = 50
-        self.strong_tau = 0.25              #判断强同步的阈值
+        self.strong_tau = 0.20              #判断强同步的阈值
         self.strong_hist = deque(maxlen=self.win_len_pairs)
         self.nsync_thresh = 250           # 窗内强同步对数阈（可变）
 
@@ -658,7 +658,7 @@ class MainCfg:
     steps: int = 300             
     a: float = 5e-2              # SPSA a0
     c: float = 1e-2              # SPSA c0
-    A: float = 35.0
+    A: float = 38.0     
     alpha: float = 0.602
     gamma: float = 0.101
     spsa_grad_clip: Optional[float] = 0.1
@@ -667,7 +667,7 @@ class MainCfg:
     lr: float = 5e-3
     wd: float = 1e-4
     epochs: int = 50
-    topk_pairs: int = 20
+    topk_pairs: int = 15
     enable_plots: bool = True   
 
 def main():
@@ -703,17 +703,13 @@ def main():
         local_kernel="gaussian"
     ).to(device)
 
-    sync_ema = 0.0         
-    ema_beta = 0.9
-    SYNC_TRIGGER = 0.02
-    PLOT_EVERY = 200
     TOPK_PAIRS = 20
 
 
     # 混合训练循环
     trig_idx = 0
     epochs = MainCfg.epochs
-    A, a0, c0, alpha, gamma = 35.0, 2e-1, 2e-2, 0.602, 0.101
+    A, a0, c0, alpha, gamma = 38.0, 2e-1, 2e-2, 0.602, 0.101
     global_step = 0
     history = []
 
