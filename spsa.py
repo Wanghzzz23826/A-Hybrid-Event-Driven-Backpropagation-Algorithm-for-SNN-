@@ -3,21 +3,23 @@ import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
-
 @torch.no_grad()
 def _spsa_update_tensor(
     W: torch.Tensor,
     model,
     X, y,
-    ce_loss,                # 函数句柄，输入 (model, X, y)，输出一个标量 loss（float 或 0-dim tensor）
+    ce_loss,
     a_k: float,
     c_k: float,
-    grad_clip: Optional[float] = None,       # 元素级裁剪
-    clip_norm: Optional[float] = None,      # 全局范数裁剪
-    auto_gain: bool = False,                # 是否根据 target_update_norm 自动缩放 update
+    grad_clip: Optional[float] = None,
+    clip_norm: Optional[float] = None,
+    auto_gain: bool = False,
     target_update_norm: Optional[float] = None,
-    gain_clip: Optional[Tuple[float, float]] = None,  # (min_gain, max_gain)
-    mask: Optional[torch.Tensor] = None,    # 可选的布尔 mask，限制哪些位置可以被更新
+    gain_clip: Optional[Tuple[float, float]] = None,
+    mask: Optional[torch.Tensor] = None,
+    proj: Optional[torch.Tensor] = None,   # 子空间基，形状 [k, D]
+    direction: str = "spsa",               # 新增：扰动分布类型： "spsa" 或 "gaussian"
+    normalize_dir: bool = False,           # 新增：是否对方向做 L2 归一化
 ):
     """
     通用的 SPSA 更新函数，对给定权重张量 W 做一次 SPSA 更新。
@@ -27,9 +29,47 @@ def _spsa_update_tensor(
     dtype = W.dtype
 
     # 生成扰动 Delta
-    Delta = torch.empty_like(W, device=device, dtype=dtype).bernoulli_(0.5).mul_(2.).sub_(1.)
+    if proj is None:
+        # --- 全维空间 ---
+        if direction == "spsa":
+            # Rademacher ±1
+            Delta = torch.empty_like(W, device=device, dtype=dtype).bernoulli_(0.5).mul_(2.).sub_(1.)
+        elif direction == "gaussian":
+            # 高斯方向
+            Delta = torch.randn_like(W, device=device, dtype=dtype)
+        else:
+            raise ValueError(f"Unknown direction mode: {direction}")
+    else:
+        # --- 子空间 proj: [k, D_flat] ---
+        flat_dim = W.numel()
+        k, D_flat = proj.shape
+        assert D_flat == flat_dim, f"proj.shape[1]={D_flat} 与 W.numel()={flat_dim} 不一致"
+
+        proj = proj.to(device=device, dtype=dtype)
+
+        if direction == "spsa":
+            # 子空间坐标上的 ±1
+            z = torch.empty(k, device=device, dtype=dtype).bernoulli_(0.5).mul_(2.).sub_(1.)
+        elif direction == "gaussian":
+            # 子空间坐标上的高斯
+            z = torch.randn(k, device=device, dtype=dtype)
+        else:
+            raise ValueError(f"Unknown direction mode: {direction}")
+
+        Delta_flat = torch.matmul(proj.transpose(0, 1), z)     
+        Delta = Delta_flat.view_as(W)
+
     if mask is not None:
         Delta = torch.where(mask, Delta, torch.zeros_like(Delta))
+
+    # 可选：对方向做 L2 归一化（只看非零元素）
+    if normalize_dir:
+        flat = Delta.view(-1)
+        if mask is not None:
+            flat = flat[mask.view(-1)]
+        norm = flat.norm().item()
+        if norm > 1e-8:
+            Delta = Delta / norm
 
     c = float(c_k)
 
@@ -99,7 +139,6 @@ def _spsa_update_tensor(
 
 
 #  W_rec 
-
 @torch.no_grad()
 def spsa_update_Wrec(
     model,
@@ -113,10 +152,10 @@ def spsa_update_Wrec(
     target_update_norm: Optional[float] = None,
     gain_clip: Optional[Tuple[float, float]] = None,
     mask: Optional[torch.Tensor] = None,
+    proj: Optional[torch.Tensor] = None,
+    direction: str = "spsa",              # 新增：方向模式
+    normalize_dir: bool = False,          # 新增：是否归一化
 ):
-    """
-    对 model.W_rec 做 SPSA 更新。
-    """
     return _spsa_update_tensor(
         model.W_rec, model, X, y, ce_loss,
         a_k, c_k,
@@ -126,11 +165,12 @@ def spsa_update_Wrec(
         target_update_norm=target_update_norm,
         gain_clip=gain_clip,
         mask=mask,
+        proj=proj,
+        direction=direction,
+        normalize_dir=normalize_dir,
     )
 
-
-# W_in 的
-
+# W_in
 @torch.no_grad()
 def spsa_update_Win(
     model,
@@ -144,10 +184,10 @@ def spsa_update_Win(
     target_update_norm: Optional[float] = None,
     gain_clip: Optional[Tuple[float, float]] = None,
     mask: Optional[torch.Tensor] = None,
+    proj: Optional[torch.Tensor] = None,
+    direction: str = "spsa",
+    normalize_dir: bool = False,
 ):
-    """
-    对 model.W_in 做 SPSA 更新。
-    """
     return _spsa_update_tensor(
         model.W_in, model, X, y, ce_loss,
         a_k, c_k,
@@ -157,6 +197,9 @@ def spsa_update_Win(
         target_update_norm=target_update_norm,
         gain_clip=gain_clip,
         mask=mask,
+        proj=proj,
+        direction=direction,
+        normalize_dir=normalize_dir,
     )
 
 @torch.no_grad()
