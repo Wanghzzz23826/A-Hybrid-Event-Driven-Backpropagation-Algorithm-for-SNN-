@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+runs/
+data/
+*.npz
+*.pth
+.DS_Store

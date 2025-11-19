@@ -1,9 +1,35 @@
-This is a workspace primarily for sharing the code for this project<br>
-- GenDatase_use.py——生成N-MNIST的小数据集<br>
-
-- spsa.py ——扰动插件<br>
-
-- big-E-supervised_local.py——依旧是之前的架构：同步时间局部更新，相比较之前减少多余的一些可视化<br>
-
-- ZO-adaptation.py——将SZO的ZO更新用在我们的rsnn架构中，但是没有用同步检测，全维扰动更新的方式<br>
-- test_weak_gate.py——降低了触发同步的条件，将近1/2更新<br>
+project/
+│
+├── configs/
+│   ├── train_cfg.py            # MainCfg 
+│   ├── zo_cfg.py               # MainCfg --use SZO's ZO
+│
+├── data/
+│   ├── nmini_dataset.py        # NMiniDataset, load_npz
+│   ├── dataloader.py           # make_dataloaders
+│
+├── models/
+│   ├── srnn.py                 # SRNN + Adapter
+│   ├── decoder.py              # logits readout modules
+│
+├── optim/
+│   ├── spsa_ops.py             # spsa_update_Wrec / Win / ce_loss_no_grad
+│   ├── sgd_ops.py              # 手工 SGD for W_out
+│
+├── monitors/
+│   ├── synchrony_monitor.py    # 同步检测
+│
+├── utils/
+│   ├── seed.py                 # set_seed
+│   ├── device.py            #auto_select_device
+│   ├── plot.py                 # savefig_safe, raster, loss figures
+│   ├── metrics.py              # evaluate, evaluate_loss
+│
+├── trainer/
+│   ├── trainer.py              
+│   ├── trainer.py              # ZO' Train
+│
+├── main.py
+├── main_zo.py                  # use SZO's update in our framework            
+├── requirements.txt
+└── README.md
